@@ -12,6 +12,7 @@ import zipfile
 import argparse
 import logging
 from pathlib import Path
+from urllib.parse import unquote
 
 
 # 日志配置
@@ -212,6 +213,29 @@ def convert_images(content: str, prefix: str = '') -> tuple[str, list[str]]:
         content
     )
 
+    # 3. 处理标准 Markdown 图片 ![alt](path/to/image.png)
+    #    提取相对路径引用的图片文件名（跳过 http/https 外部链接）
+    def replace_markdown_image(match: re.Match[str]) -> str:
+        img_path = match.group(2)
+
+        # 跳过外部链接（http/https）
+        if img_path.startswith('http://') or img_path.startswith('https://'):
+            return match.group(0)
+
+        # 提取纯文件名
+        img_filename = _replace_excalidraw(Path(img_path).name)
+        if img_filename:
+            image_files.append(img_filename)
+
+        # 替换为带前缀的路径
+        return f'![{match.group(1)}]({normalized_prefix}{img_filename})'
+
+    content = re.sub(
+        r'!\[([^\]]*)\]\(([^)]+)\)',
+        replace_markdown_image,
+        content
+    )
+
     return content, image_files
 
 
@@ -248,28 +272,86 @@ def convert_internal_links(content: str, _front_matter: dict[str, str] | None = 
     return content
 
 
-def find_attachments_dir(md_file_path: str) -> Path:
+def find_attachments_dir(md_file_path: str, max_levels: int = 6) -> Path:
     """
     查找附件文件夹
-    优先查找 md 文件同级目录下的 attachments 文件夹，返回 Path 对象。
+    从 md 文件所在目录向上遍历目录树，查找常见的附件文件夹名称。
+    如果都没找到，返回 md 文件所在目录。
+
+    max_levels: 向上查找的最大层级数（防止无限循环）
     """
     md_path = Path(md_file_path).resolve()
     md_dir = md_path.parent
 
-    # 检查 attachments 文件夹
-    attachments_dir = md_dir / 'attachments'
-    if attachments_dir.exists():
-        return attachments_dir
+    # 常见的附件文件夹名称
+    common_names = ['attachments', 'Attachments', 'assets', 'Assets', 'images', 'Images']
 
-    # 尝试一些常见的附件文件夹名称
-    common_names = ['Attachments', 'assets', 'Assets', 'images', 'Images']
-    for name in common_names:
-        candidate = md_dir / name
-        if candidate.exists():
-            return candidate
+    # 从 md 文件所在目录开始，向上逐级查找
+    current_dir = md_dir
+    for _ in range(max_levels):
+        for name in common_names:
+            candidate = current_dir / name
+            if candidate.exists() and candidate.is_dir():
+                logging.info('找到附件目录: %s', candidate)
+                return candidate
+
+        # 也检查当前目录下是否有图片文件（可能图片直接放在 md 同级目录）
+        try:
+            has_images = any(
+                f.suffix.lower() in ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.bmp')
+                for f in current_dir.iterdir()
+                if f.is_file()
+            )
+            if has_images:
+                logging.info('在当前目录找到图片文件: %s', current_dir)
+                return current_dir
+        except OSError:
+            pass
+
+        # 向上一级
+        parent = current_dir.parent
+        if parent == current_dir:
+            break  # 已到达文件系统根目录
+        current_dir = parent
 
     # 如果都没找到，返回 md 文件所在目录
+    logging.info('未找到专用附件目录，使用 md 文件所在目录: %s', md_dir)
     return md_dir
+
+
+def _search_file_recursive(root_dir: Path, filename: str) -> Path | None:
+    """
+    在 root_dir 目录树中递归搜索指定文件名的文件。
+    先尝试精确路径匹配，再尝试仅按文件名匹配（忽略路径部分）。
+    返回找到的文件完整路径，找不到返回 None。
+    """
+    # 1. 先尝试直接路径拼接
+    direct_path = root_dir / filename
+    if direct_path.exists():
+        return direct_path
+
+    # 2. 提取纯文件名（去掉可能存在的路径部分）
+    pure_filename = Path(filename).name
+
+    # 3. 在目录树中递归搜索
+    try:
+        for candidate in root_dir.rglob(pure_filename):
+            if candidate.is_file():
+                return candidate
+    except OSError:
+        pass
+
+    # 4. 尝试 URL 解码后的文件名（处理 %20 等编码）
+    decoded_name = unquote(pure_filename)
+    if decoded_name != pure_filename:
+        try:
+            for candidate in root_dir.rglob(decoded_name):
+                if candidate.is_file():
+                    return candidate
+        except OSError:
+            pass
+
+    return None
 
 
 def extract_image_files(
@@ -278,32 +360,35 @@ def extract_image_files(
     output_dir: Path,
 ) -> list[str]:
     """
-    从附件文件夹中提取图片文件到输出目录
-    attachments_dir 和 output_dir 均为 Path 对象
+    从附件文件夹中提取图片文件到输出目录。
+    支持递归搜索子目录，支持路径化文件名（如 subdir/image.png）。
+    attachments_dir 和 output_dir 均为 Path 对象。
     """
     copied_files: list[str] = []
 
     for filename in image_files:
-        src_path = attachments_dir / filename
-        dst_path = output_dir / filename
+        # 使用递归搜索查找源文件
+        src_path = _search_file_recursive(attachments_dir, filename)
+        dst_path = output_dir / Path(filename).name  # 输出到扁平目录，只用纯文件名
 
-        if src_path.exists():
+        if src_path is not None:
             try:
                 _ = shutil.copy2(str(src_path), str(dst_path))
                 copied_files.append(filename)
-                logging.info('已复制图片: %s', filename)
+                logging.info('已复制图片: %s → %s', src_path.name, dst_path.name)
             except OSError as e:
                 logging.warning('复制图片 %s 失败: %s', filename, e)
         else:
             # 尝试查找 Excalidraw 的 svg 版本（如果原始是 excalidraw）
             if filename.endswith('.svg'):
-                excalidraw_src = attachments_dir / filename.replace('.svg', '.excalidraw')
-                if excalidraw_src.exists():
+                excalidraw_name = filename.replace('.svg', '.excalidraw')
+                excalidraw_src = _search_file_recursive(attachments_dir, excalidraw_name)
+                if excalidraw_src is not None:
                     logging.info(
                         '提示: 找到 %s，但需要手动转换为 SVG',
-                        filename.replace('.svg', '.excalidraw'),
+                        excalidraw_name,
                     )
-            logging.warning('未找到图片文件: %s', filename)
+            logging.warning('未找到图片文件: %s（已递归搜索 %s）', filename, attachments_dir)
 
     return copied_files
 
